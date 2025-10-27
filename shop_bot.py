@@ -1,3 +1,4 @@
+from health_server import start_health_server_in_thread, mark_ready, mark_tg_ping_ok, mark_tg_ping_fail
 # -*- coding: utf-8 -*-
 """
 Telegram Shop Bot — premium edition (python-telegram-bot 21.x)
@@ -12,8 +13,10 @@ Telegram Shop Bot — premium edition (python-telegram-bot 21.x)
 """
 
 from __future__ import annotations
+BOT_VERSION = "DS-2025-10-16-qa2"
 
 import json
+import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime
@@ -308,6 +311,63 @@ async def clear_cart_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await q.message.edit_text(text, reply_markup=cart_ikb(False), parse_mode=ParseMode.HTML)
 
 # — Оформление заказа с авто-username
+
+async def pay_qty_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    _, pid, qty_s = q.data.split(":", 2)
+    try:
+        qty = max(1, min(100, int(qty_s)))
+    except ValueError:
+        await q.answer("Некорректное число", show_alert=True)
+        return ConversationHandler.END
+    if pid not in PRODUCTS:
+        await q.answer("Услуга не найдена", show_alert=True)
+        return ConversationHandler.END
+    with CART_LOCK:
+        cart = CART.setdefault(q.from_user.id, {})
+        cart[pid] = cart.get(pid, 0) + qty
+    await q.answer(f"Добавлено: {qty} шт.")
+    return await checkout_cb(update, context)
+
+
+async def pay_qty_custom_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    pid = q.data.split(":", 1)[1]
+    if pid not in PRODUCTS:
+        await q.answer("Услуга не найдена", show_alert=True)
+        return ConversationHandler.END
+    context.user_data["await_custom_qty"] = True
+    context.user_data["pay_pid"] = pid
+    await q.message.edit_text("<b>Введите количество (1–100)</b>", parse_mode=ParseMode.HTML,
+                              reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"view:{pid}")]]))
+    await q.answer()
+    return ConversationHandler.END
+
+
+async def custom_qty_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data.get("await_custom_qty"):
+        return
+    pid = context.user_data.get("pay_pid")
+    text = (update.message.text or "").strip()
+    if not text.isdigit():
+        await update.message.reply_text("Введите число от 1 до 100.")
+        return
+    qty = int(text)
+    if not 1 <= qty <= 100:
+        await update.message.reply_text("Введите число от 1 до 100.")
+        return
+    with CART_LOCK:
+        cart = CART.setdefault(update.message.from_user.id, {})
+        cart[pid] = cart.get(pid, 0) + qty
+    context.user_data.pop("await_custom_qty", None)
+    context.user_data.pop("pay_pid", None)
+    await update.message.reply_text("Количество добавлено. Переходим к оформлению…")
+    class _FakeQ:
+        def __init__(self, message): self.from_user = message.from_user; self.message = message
+        async def answer(self, *a, **kw): pass
+    fake_update = type("U", (), {"callback_query": _FakeQ(update.message)})()
+    await checkout_cb(fake_update, context)
+
 async def checkout_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     items = get_cart(q.from_user.id)
@@ -485,18 +545,36 @@ async def cancel_question(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text("❌ Отменено.", reply_markup=menu_kb())
     return ConversationHandler.END
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Служебные команды
+# ─────────────────────────────────────────────────────────────────────────────
+async def version_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (
+        f"<b>Digital Shop Bot</b>\n"
+        f"Version: <code>{BOT_VERSION}</code>\n"
+        f"Products: <code>{', '.join(PRODUCTS.keys())}</code>\n"
+        f"Pay link set: <code>{'yes' if PAY_LINK else 'no'}</code>"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 # ─────────────────────────────────────────────────────────────────────────────
 # Приложение
 # ─────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
 def build_application():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN не задан в .env")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+    logging.info(f"Loaded products: {list(PRODUCTS.keys())}")
+    logging.info(f"Payment link: {PAY_LINK}")
 
     # Базовые хендлеры
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("version", version_cmd))
     app.add_handler(MessageHandler(filters.Regex(r"^Каталог$"), show_catalog))
     app.add_handler(MessageHandler(filters.Regex(r"^Корзина$"), show_cart))
+    app.add_handler(MessageHandler(filters.Regex(r"^[0-9]{1,3}$"), custom_qty_message))
     app.add_handler(CallbackQueryHandler(view_product_cb, pattern=r"^view:"))
     app.add_handler(CallbackQueryHandler(add_to_cart_cb, pattern=r"^add:"))
     app.add_handler(CallbackQueryHandler(back_catalog_cb, pattern=r"^back:catalog$"))
@@ -548,5 +626,22 @@ def build_application():
 
 if __name__ == "__main__":
     application = build_application()
-    print("Bot is running...")
-    application.run_polling()
+    run_mode = os.getenv("RUN_MODE", "polling").lower()
+    if run_mode == "webhook":
+        port = int(os.getenv("PORT", "10000"))
+        public_url = os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL")
+        secret = os.getenv("WEBHOOK_SECRET", "")
+        if not public_url:
+            raise RuntimeError("Для webhook укажите PUBLIC_URL (или RENDER_EXTERNAL_URL) в переменных окружения.")
+        logging.info(f"Starting in WEBHOOK mode on port {port}, public URL: {public_url}")
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=f"/webhook/{BOT_TOKEN}",
+            webhook_url=f"{public_url}/webhook/{BOT_TOKEN}",
+            secret_token=secret,
+            drop_pending_updates=True,
+        )
+    else:
+        logging.info("Starting in POLLING mode")
+        application.run_polling(drop_pending_updates=True)
