@@ -1,3 +1,4 @@
+from __future__ import annotations
 from health_server import start_health_server_in_thread, mark_ready, mark_tg_ping_ok, mark_tg_ping_fail
 # -*- coding: utf-8 -*-
 """
@@ -12,7 +13,6 @@ Telegram Shop Bot — premium edition (python-telegram-bot 21.x)
 • «Задать вопрос» с мостом: админ может ответить пользователю через /reply <user_id> <текст>
 """
 
-from __future__ import annotations
 BOT_VERSION = "DS-2025-10-16-qa2"
 
 import json
